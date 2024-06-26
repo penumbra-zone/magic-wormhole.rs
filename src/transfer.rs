@@ -14,6 +14,8 @@ use serde_derive::{Deserialize, Serialize};
 use serde_json::json;
 use std::sync::Arc;
 
+use crate::transfer::v1::AnswerMessage;
+
 use super::{core::WormholeError, transit, AppID, Wormhole};
 use futures::Future;
 use log::*;
@@ -30,7 +32,10 @@ mod cancel;
 mod v1;
 mod v2;
 
-pub use v1::ReceiveRequest as ReceiveRequestV1;
+pub use v1::{
+    ReceiveFileRequest as ReceiveFileRequestV1, ReceiveRequest as ReceiveRequestV1,
+    ReceiveTextRequest as ReceiveTextRequestV1,
+};
 pub use v2::ReceiveRequest as ReceiveRequestV2;
 
 const APPID_RAW: &str = "lothar.com/wormhole/text-or-file-xfer";
@@ -247,7 +252,6 @@ impl PeerMessage {
         })
     }
 
-    #[allow(dead_code)]
     fn message_ack_v1(msg: impl Into<String>) -> Self {
         PeerMessage::Answer(v1::AnswerMessage::MessageAck(msg.into()))
     }
@@ -831,6 +835,37 @@ pub async fn send(
         )
         .await
     }
+}
+
+pub async fn send_text(
+    mut wormhole: Wormhole,
+    message: String,
+    relay_hints: Vec<transit::RelayHint>,
+    transit_abilities: transit::Abilities,
+) -> Result<(), TransferError> {
+    // Send file offer message.
+    debug!("Sending message offer");
+    transit::init(transit_abilities, None, relay_hints).await?;
+    wormhole
+        .send_json(&PeerMessage::offer_message_v1(message))
+        .await?;
+
+    let ack_msg = wormhole.receive_json::<PeerMessage>().await??;
+    debug!("Received text ack message: {:?}", ack_msg);
+
+    match ack_msg.check_err()? {
+        PeerMessage::Answer(AnswerMessage::MessageAck(msg)) => {
+            ensure!(msg == "ok", TransferError::AckError);
+        },
+        _ => {
+            bail!(TransferError::unexpected_message(
+                "answer/file_ack",
+                ack_msg
+            ));
+        },
+    }
+
+    Ok(())
 }
 
 /**

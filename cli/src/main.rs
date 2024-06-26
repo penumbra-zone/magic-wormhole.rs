@@ -1,7 +1,10 @@
 #![allow(clippy::too_many_arguments)]
 mod util;
 
-use std::time::{Duration, Instant};
+use std::{
+    io::Read,
+    time::{Duration, Instant},
+};
 
 use arboard::Clipboard;
 use async_std::sync::Arc;
@@ -12,7 +15,11 @@ use futures::{future::Either, Future, FutureExt};
 use indicatif::{MultiProgress, ProgressBar};
 use std::{io::Write, path::PathBuf};
 
-use magic_wormhole::{forwarding, transfer, transit, MailboxConnection, Wormhole};
+use magic_wormhole::{
+    forwarding,
+    transfer::{self, send_text},
+    transit, MailboxConnection, Wormhole,
+};
 
 fn install_ctrlc_handler(
 ) -> eyre::Result<impl Fn() -> futures::future::BoxFuture<'static, ()> + Clone> {
@@ -59,6 +66,9 @@ struct CommonSenderArgs {
     /// Not allowed when sending more than one file.
     #[clap(long = "rename", visible_alias = "name", value_name = "FILE_NAME")]
     file_name: Option<String>,
+    /// text message to send, instead of a file. Use '-' to read from stdin.
+    #[clap(long = "text", action)]
+    text: bool,
     #[clap(
         index = 1,
         required = true,
@@ -290,11 +300,28 @@ async fn main() -> eyre::Result<()> {
         WormholeCommand::Send {
             common,
             common_leader: CommonLeaderArgs { code, code_length },
-            common_send: CommonSenderArgs { file_name, files },
+            common_send:
+                CommonSenderArgs {
+                    file_name,
+                    text,
+                    files,
+                },
             ..
         } => {
-            let offer = make_send_offer(files, file_name).await?;
-
+            let message = if text {
+                let message_bytes = match file_name.as_ref().map(|x| (x == "-", x)) {
+                    None | Some((true, _)) => {
+                        println!("Enter message to send:");
+                        let mut input = Vec::new();
+                        std::io::stdin().lock().read_to_end(&mut input)?;
+                        input
+                    },
+                    Some((_, x)) => std::fs::read(x)?,
+                };
+                Some(String::from_utf8(message_bytes)?)
+            } else {
+                None
+            };
             let transit_abilities = parse_transit_args(&common);
             let (wormhole, _code, relay_hints) = match util::cancellable(
                 Box::pin(parse_and_connect(
@@ -315,6 +342,13 @@ async fn main() -> eyre::Result<()> {
                 Err(_) => return Ok(()),
             };
 
+            if text {
+                return send_text(wormhole, message.unwrap(), relay_hints, transit_abilities)
+                    .await
+                    .context("failed to send text message");
+            }
+
+            let offer = make_send_offer(files, file_name).await?;
             Box::pin(send(
                 wormhole,
                 relay_hints,
@@ -330,9 +364,17 @@ async fn main() -> eyre::Result<()> {
             timeout,
             common,
             common_leader: CommonLeaderArgs { code, code_length },
-            common_send: CommonSenderArgs { file_name, files },
+            common_send:
+                CommonSenderArgs {
+                    file_name,
+                    text,
+                    files,
+                },
             ..
         } => {
+            if text {
+                unimplemented!("text mode not implemented yet");
+            }
             let transit_abilities = parse_transit_args(&common);
             let (wormhole, code, relay_hints) = {
                 let connect_fut = Box::pin(parse_and_connect(
@@ -952,6 +994,12 @@ async fn receive_inner_v1(
     ctrl_c: impl Fn() -> futures::future::BoxFuture<'static, ()>,
 ) -> eyre::Result<()> {
     use async_std::fs::OpenOptions;
+    let req = match req {
+        transfer::ReceiveRequestV1::File(req) => req,
+        transfer::ReceiveRequestV1::Text(x) => {
+            return x.accept().await.context("receive process failed");
+        },
+    };
 
     /*
      * Control flow is a bit tricky here:
